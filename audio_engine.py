@@ -32,6 +32,11 @@ class Footstep:
     t_ms: int
     gain: float  # overall volume (0..1)
     pan: float   # -1..1
+@dataclass
+class Squeak:
+    t_ms: int
+    gain: float
+    pan: float
 
 class Mixer:
     def __init__(self, cfg: Audio):
@@ -48,44 +53,36 @@ class Mixer:
         delta = peak - self.cfg.limiter_threshold_db
         gain_red = delta - delta/self.cfg.limiter_ratio
         return seg.apply_gain(-gain_red)
-
 class Assets:
     def __init__(self, sample_rate: int):
         self.sr = sample_rate
-        self.foot = None
+        self.foot_L = None
+        self.foot_R = None
+        self.squeak = None
 
-    def load(self, path: Optional[str]):
+    def load(self, foot_path: Optional[str] = None, squeak_path: Optional[str] = None):
         from pydub import AudioSegment
-        if path is None:
-            # synthesize a thump if no asset provided
-            self.foot = self._synth_click()
+
+        # Footsteps (as before)
+        if foot_path is None:
+            self.foot_L = self._synth_click()
+            self.foot_R = self._synth_click().invert_phase()
         else:
-            self.foot = AudioSegment.from_file(path).set_frame_rate(self.sr).set_channels(2)
-        # shape it: short decay
-        self.foot = self.foot[:140].fade_out(90)
+            import os
+            base = os.path.splitext(foot_path)[0]
+            left_file = base + "_L.wav"
+            right_file = base + "_R.wav"
+            if not os.path.exists(left_file): left_file = foot_path
+            if not os.path.exists(right_file): right_file = foot_path
+            self.foot_L = AudioSegment.from_file(left_file).set_frame_rate(self.sr).set_channels(2)
+            self.foot_R = AudioSegment.from_file(right_file).set_frame_rate(self.sr).set_channels(2)
 
-    def _synth_click(self) -> AudioSegment:
-        import numpy as np
-
-        dur_ms = 120
-        n = int(self.sr * dur_ms / 1000)
-        # random noise burst
-        noise = (np.random.randn(n) * 0.15).astype("float32")
-
-        # exponential decay envelope
-        env = np.exp(-np.linspace(0, 8, n)).astype("float32")
-        wave = (noise * env).clip(-1, 1)
-
-        # convert to 16-bit PCM
-        raw = (wave * 32767).astype("int16").tobytes()
-
-        mono = AudioSegment(
-            data=raw,  # use 'data' instead of 'raw_data'
-            sample_width=2,
-            frame_rate=self.sr,
-            channels=1,
-        )
-        return mono.set_channels(2)
+        if squeak_path is None:
+            print("[warn] No squeak file specified — skipping squeak events.")
+        else:
+            self.squeak = AudioSegment.from_file(squeak_path).set_frame_rate(self.sr).set_channels(2)
+            # Optionally shorten / fade
+            self.squeak = self.squeak[:250].fade_out(100)
 
 # Map speed (m/s) → steps per minute (very rough fit)
 # 0 m/s → 0 spm, 1.5 → ~110 spm, 3.0 → ~150 spm, 6.0 → ~190 spm
@@ -138,6 +135,41 @@ def footsteps_from_frames(frames, lead_ms: int = 0) -> List[Footstep]:
             last_step_time = t_ms
     return events
 
+# Generate squeak events from frames based on deceleration and turning
+
+def squeaks_from_frames(frames, accel_threshold=2.5, turn_threshold_deg=35.0) -> List[Squeak]:
+    squeaks: List[Squeak] = []
+    last_vx, last_vy = frames[0].vx, frames[0].vy
+    last_speed = frames[0].speed_mps
+
+    for fr in frames[1:]:
+        # --- speed drop detection ---
+        dv = last_speed - fr.speed_mps
+        dt = max(fr.t_s - frames[0].t_s, 1e-3)
+        decel = dv / dt if dv > 0 else 0.0
+
+        # --- direction change detection ---
+        dot = last_vx * fr.vx + last_vy * fr.vy
+        mag1 = math.hypot(last_vx, last_vy)
+        mag2 = math.hypot(fr.vx, fr.vy)
+        if mag1 > 1e-3 and mag2 > 1e-3:
+            cos_angle = max(-1.0, min(1.0, dot / (mag1 * mag2)))
+            angle = math.degrees(math.acos(cos_angle))
+        else:
+            angle = 0.0
+
+        if decel > accel_threshold or angle > turn_threshold_deg:
+            gain, pan = compute_audio_params(fr)
+            squeaks.append(Squeak(
+                t_ms=int(fr.t_s * 1000.0),
+                gain=gain * 0.8,   # slightly lower volume than footstep
+                pan=pan
+            ))
+
+        last_vx, last_vy, last_speed = fr.vx, fr.vy, fr.speed_mps
+
+    return squeaks
+
 # Compute distance attenuation, intensity, and stereo pan from a frame containing (x, y, speed_mps).
 
 def compute_audio_params(fr):
@@ -186,21 +218,7 @@ def compute_audio_params(fr):
 def render_footsteps(frames, foot_path: Optional[str], duration_ms: int, cfg: Audio) -> AudioSegment:
     assets = Assets(cfg.sample_rate)
     # load left/right variants (mono or stereo)
-    if foot_path:
-        import os
-        base = os.path.splitext(foot_path)[0]
-        left_file = base + "_L.wav"
-        right_file = base + "_R.wav"
-        if not os.path.exists(left_file):
-            left_file = foot_path
-        if not os.path.exists(right_file):
-            right_file = foot_path
-        assets.foot_L = AudioSegment.from_file(left_file).set_frame_rate(cfg.sample_rate).set_channels(2)
-        assets.foot_R = AudioSegment.from_file(right_file).set_frame_rate(cfg.sample_rate).set_channels(2)
-    else:
-        # use synthetic thumps if none provided
-        assets.foot_L = assets._synth_click()
-        assets.foot_R = assets._synth_click().invert_phase()  # subtle difference
+    assets.load(foot_path, squeak_path="./assets/squeak.wav")
 
     mixer = Mixer(cfg)
     mix = mixer.make_timeline(duration_ms)
@@ -233,6 +251,11 @@ def render_footsteps(frames, foot_path: Optional[str], duration_ms: int, cfg: Au
         seg = seg.apply_gain(lin_to_db(total_v))
 
         mix = mix.overlay(seg, position=ev.t_ms)
+    
+    for sq in squeaks_from_frames(frames):
+        seg = assets.squeak.apply_gain(lin_to_db(sq.gain))
+        seg = apply_pan(seg, sq.pan)
+        mix = mix.overlay(seg, position=sq.t_ms)
 
 
     mix = mixer.limiter(mix)
