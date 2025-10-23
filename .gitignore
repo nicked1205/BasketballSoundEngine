@@ -1,9 +1,0 @@
-# Ignore audio files
-*.mp3
-*.MP3
-*.wav
-*.WAV
-
-# Ignore CSV data files
-*.csv
-*.CSV
