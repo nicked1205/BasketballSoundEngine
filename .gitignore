@@ -7,3 +7,5 @@
 # Ignore CSV data files
 *.csv
 *.CSV
+
+comprehensive_data.csv
