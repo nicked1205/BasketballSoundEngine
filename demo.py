@@ -13,8 +13,8 @@ if __name__ == "__main__":
                         help="Choose between synthetic or real tracking data")
     parser.add_argument("--csv", type=str, default="comprehensive_data.csv",
                         help="CSV file for real data mode")
-    parser.add_argument("--player", type=int, default=None,
-                    help="Player ID to render (if not set, loads all players)")
+    parser.add_argument("--player-name", type=str, default=None,
+                    help="Player name to render (case-insensitive, matches player_name column)")
     parser.add_argument("--foot", type=str, default="./assets/footsteps.mp3",
                         help="Path to footstep sound")
     parser.add_argument("--out", type=str, default="footsteps_demo.wav",
@@ -32,7 +32,7 @@ if __name__ == "__main__":
         write_csv(frames, "synthetic_data.csv")
     else:
         print(f"[mode] Using real data from {args.csv}")
-        frames = load_frames_from_csv(args.csv, fps=args.fps, player_id=args.player)
+        frames = load_frames_from_csv(args.csv, fps=args.fps, player_name=args.player_name)
 
     # --- compute duration ---
     duration_ms = int((frames[-1].t_s + 2.0) * 1000)

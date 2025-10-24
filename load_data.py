@@ -14,41 +14,45 @@ class Frame:
     speed_mps: float
 
 
-def load_frames_from_csv(path: str, fps: float = 30.0, player_id: int = None):
+def load_frames_from_csv(path: str, fps: float = 30.0, player_name: str = None):
     """
     Load tracking data from comprehensive_data.csv.
-    If player_id is provided, filters to that player only.
+    Filters by player_name (string).
     Computes velocity, acceleration, and speed automatically.
     """
 
     df = pd.read_csv(path)
 
-    # Optional filter for a specific player
-    if player_id is not None:
-        df = df[df["player_id"] == player_id]
+    # --- Filter by player name ---
+    if player_name is not None:
+        df = df[df["player_name"].astype(str).str.lower() == player_name.lower()]
         if df.empty:
-            raise ValueError(f"No data found for player_id={player_id}")
+            available = df["player_name"].unique()
+            raise ValueError(
+                f"No data found for player_name='{player_name}'.\n"
+                f"Available names: {list(available)}"
+            )
 
-    # Sort frames to ensure time order
+    # Sort frames in chronological order
     df = df.sort_values("frame_number").reset_index(drop=True)
 
     # Compute time (s)
     df["t_s"] = df["frame_number"] / fps
 
-    # Rename to match engine expectations
+    # --- Rename columns to engine format ---
     df = df.rename(columns={
         "court_x_normalized": "x",
         "court_y_normalized": "y",
     })
 
-    # Compute finite difference velocities
+    # --- Compute velocities, accelerations, speed ---
     df["vx"] = df["x"].diff().fillna(0) * fps
     df["vy"] = df["y"].diff().fillna(0) * fps
     df["ax"] = df["vx"].diff().fillna(0) * fps
     df["ay"] = df["vy"].diff().fillna(0) * fps
     df["speed_mps"] = (df["vx"] ** 2 + df["vy"] ** 2) ** 0.5
 
-    # Convert rows → Frame objects
+    # --- Convert to Frame objects ---
     frames = [
         Frame(
             frame=int(row["frame_number"]),
@@ -64,5 +68,5 @@ def load_frames_from_csv(path: str, fps: float = 30.0, player_id: int = None):
         for _, row in df.iterrows()
     ]
 
-    print(f"[ok] Loaded {len(frames)} frames from {path} (player_id={player_id or 'ALL'})")
+    print(f"[ok] Loaded {len(frames)} frames from {path} (player_name='{player_name or 'ALL'}')")
     return frames

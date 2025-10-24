@@ -128,47 +128,106 @@ def footsteps_from_frames(frames, lead_ms: int = 0) -> List[Footstep]:
             side = "R" if side == "L" else "L"
             events.append(Footstep(
                 t_ms=int(t_ms),
-                gain=fr.total_v,
-                pan=fr.pan,
+                gain=0.0,
+                pan=0.0,
                 side=side
             ))
             last_step_time = t_ms
     return events
 
+def randomize_footstep(seg: AudioSegment, side: str) -> AudioSegment:
+    """Randomize pitch, duration, brightness, and level of a footstep sound."""
+    import random
+
+    # Slight pitch variation (±3%)
+    semitones = random.uniform(-1, 1)
+    new_rate = int(seg.frame_rate * (2 ** (semitones / 12.0)))
+    seg = seg._spawn(seg.raw_data, overrides={"frame_rate": new_rate}).set_frame_rate(seg.frame_rate)
+
+    # Random length trimming (simulate varying pressure/time)
+    length_factor = random.uniform(0.9, 1.0)
+    seg = seg[:int(len(seg) * length_factor)].fade_out(int(50 * length_factor))
+
+    # Brightness variation (EQ filtering)
+    if random.random() < 0.9:
+        cutoff = random.uniform(1800, 3500)
+        seg = seg.high_pass_filter(cutoff)
+    else:
+        cutoff = random.uniform(5000, 8000)
+        seg = seg.high_pass_filter(cutoff)
+
+    # Micro timing offset (simulate imperfect stride timing)
+    offset = random.uniform(-15, 15)  # ±15 ms offset
+    seg = seg.fade_in(10).fade_out(80)
+
+    return seg, offset
+
 # Generate squeak events from frames based on deceleration and turning
 
-def squeaks_from_frames(frames, accel_threshold=2.5, turn_threshold_deg=35.0) -> List[Squeak]:
-    squeaks: List[Squeak] = []
+def squeaks_from_frames(
+    frames,
+    accel_threshold=4.5,        # m/s² minimum decel to trigger
+    turn_threshold_deg=45.0,    # must turn at least this angle
+    min_speed_for_event=1.5,    # ignore slow walks
+    cooldown=0.5,               # seconds between squeaks
+):
+    squeaks = []
     last_vx, last_vy = frames[0].vx, frames[0].vy
     last_speed = frames[0].speed_mps
+    last_t = frames[0].t_s
+    last_squeak_time = -999.0
 
     for fr in frames[1:]:
-        # --- speed drop detection ---
+        dt = max(fr.t_s - last_t, 1e-3)
         dv = last_speed - fr.speed_mps
-        dt = max(fr.t_s - frames[0].t_s, 1e-3)
         decel = dv / dt if dv > 0 else 0.0
 
-        # --- direction change detection ---
+        # Direction change
         dot = last_vx * fr.vx + last_vy * fr.vy
         mag1 = math.hypot(last_vx, last_vy)
         mag2 = math.hypot(fr.vx, fr.vy)
+        angle = 0.0
         if mag1 > 1e-3 and mag2 > 1e-3:
             cos_angle = max(-1.0, min(1.0, dot / (mag1 * mag2)))
             angle = math.degrees(math.acos(cos_angle))
-        else:
-            angle = 0.0
 
-        if decel > accel_threshold or angle > turn_threshold_deg:
-            gain, pan = compute_audio_params(fr)
-            squeaks.append(Squeak(
+        # Conditions for squeak
+        is_turn = angle > turn_threshold_deg
+        is_brake = decel > accel_threshold
+        is_moving = fr.speed_mps > min_speed_for_event
+        enough_time = (fr.t_s - last_squeak_time) > cooldown
+
+        if (is_turn or is_brake) and is_moving and enough_time:
+            gain, pan, dist = compute_audio_params(fr)
+            squeaks.append(Footstep(
                 t_ms=int(fr.t_s * 1000.0),
-                gain=gain * 0.8,   # slightly lower volume than footstep
-                pan=pan
+                gain=gain * 0.9,
+                pan=pan,
+                side="L"
             ))
+            last_squeak_time = fr.t_s
 
-        last_vx, last_vy, last_speed = fr.vx, fr.vy, fr.speed_mps
+        last_vx, last_vy, last_speed, last_t = fr.vx, fr.vy, fr.speed_mps, fr.t_s
 
     return squeaks
+
+def randomize_squeak(seg: AudioSegment) -> AudioSegment:
+    # pitch jitter
+    semitones = random.uniform(-2.0, 2.0)
+    if semitones > 0:
+        seg = seg.high_pass_filter(1000)
+    else:
+        seg = seg.low_pass_filter(4000)
+    new_rate = int(seg.frame_rate * (2 ** (semitones / 12.0)))
+    seg = seg._spawn(seg.raw_data, overrides={"frame_rate": new_rate}).set_frame_rate(seg.frame_rate)
+
+    # dynamic length (truncate tail randomly 80–100%)
+    length_factor = random.uniform(0.8, 1.0)
+    seg = seg[:int(len(seg) * length_factor)].fade_out(int(40 * length_factor))
+
+    # gain variation (±2 dB)
+    seg = seg.apply_gain(random.uniform(-2.0, 2.0))
+    return seg
 
 # Compute distance attenuation, intensity, and stereo pan from a frame containing (x, y, speed_mps).
 
@@ -210,8 +269,62 @@ def compute_audio_params(fr):
 
     print(f"[debug] t={fr.t_s:.2f}s y={fr.y:.2f} dist={dist:.2f} dvol={dvol:.2f} inten={inten:.2f} total_v={total_v:.2f} pan={pan:.2f}")
 
-    return total_v, pan
+    return total_v, pan, dist
 
+# Adds random echoes to simulate complex reflections in an indoor court.
+
+def add_random_echoes(seg: AudioSegment, max_reflections: int = 3) -> AudioSegment:
+    import random
+
+    n_reflections = random.randint(1, max_reflections)
+    wet = seg
+    for _ in range(n_reflections):
+        delay = random.uniform(20, 80)        # ms
+        gain = random.uniform(-12, -4)        # dB quieter
+        pan = random.uniform(-0.3, 0.3)       # small stereo offset
+
+        echo = apply_pan(seg - abs(gain), pan)
+        wet = wet.overlay(echo, position=delay)
+
+    # optional slight tail fade
+    return wet.fade_out(50)
+
+
+# Adds subtle early reflections to simulate court acoustics.
+
+def add_reflections(seg: AudioSegment, dist: float) -> AudioSegment:
+    # Reflection timing and strength depend on distance
+    floor_delay = 25  # ms
+    wall_delay = 80   # ms
+    base_gain = -9 if dist < 10 else -12  # closer sounds = stronger reflections
+
+    # Create early reflections
+    floor_echo = seg - (base_gain + random.uniform(0, 2))
+    wall_echo = seg - (base_gain + 6 + random.uniform(0, 3))
+
+    seg = seg.overlay(floor_echo, position=floor_delay)
+    seg = seg.overlay(wall_echo, position=wall_delay)
+
+    return seg
+
+def generate_ambient_noise(duration_ms: int, sr: int) -> AudioSegment:
+    import numpy as np
+    n = int(sr * duration_ms / 1000)
+    noise = (np.random.randn(n) * 0.03).astype("float32")
+
+    # Band-limit the noise (simulate low-mid room hum)
+    from scipy.signal import butter, lfilter
+    b, a = butter(4, [100/(sr/2), 3000/(sr/2)], btype="band")
+    filtered = lfilter(b, a, noise)
+
+    raw = (filtered * 32767).astype("int16").tobytes()
+    amb = AudioSegment(
+        data=raw,
+        sample_width=2,
+        frame_rate=sr,
+        channels=2
+    )
+    return amb - 25  # make it subtle
 
 # Render footsteps with alternating left/right samples
 
@@ -228,20 +341,15 @@ def render_footsteps(frames, foot_path: Optional[str], duration_ms: int, cfg: Au
         nearest = min(frames, key=lambda f: abs(f.t_s * 1000 - ev.t_ms))
 
         # Compute gain & pan from physical data
-        total_v, pan = compute_audio_params(nearest)
+        total_v, pan, dist = compute_audio_params(nearest)
 
         base = assets.foot_L if ev.side == "L" else assets.foot_R
 
-        # --- random pitch shift (±2%) ---
-        semitones = random.uniform(-0.35, 0.35)
-        if abs(semitones) > 1e-4:
-            new_rate = int(base.frame_rate * (2 ** (semitones / 12.0)))
-            seg = base._spawn(base.raw_data, overrides={"frame_rate": new_rate}).set_frame_rate(base.frame_rate)
-        else:
-            seg = base
+        # --- randomized footstep processing ---
+        seg, offset = randomize_footstep(base, ev.side)
 
-        # --- random volume jitter (±1 dB) ---
-        seg = seg.apply_gain(random.uniform(-1.0, 1.0))
+        # --- add early reflections ---
+        seg = add_reflections(seg, dist)
 
         # --- slight stereo bias depending on foot ---
         pan_offset = -0.01 if ev.side == "L" else 0.01
@@ -249,14 +357,26 @@ def render_footsteps(frames, foot_path: Optional[str], duration_ms: int, cfg: Au
 
         # --- apply distance × intensity scaling ---
         seg = seg.apply_gain(lin_to_db(total_v))
-
+        
         mix = mix.overlay(seg, position=ev.t_ms)
     
-    for sq in squeaks_from_frames(frames):
-        seg = assets.squeak.apply_gain(lin_to_db(sq.gain))
-        seg = apply_pan(seg, sq.pan)
-        mix = mix.overlay(seg, position=sq.t_ms)
+    squeaks = squeaks_from_frames(frames)
+    print(f"[debug] {len(squeaks)} squeaks detected")
 
+    if assets.squeak is not None and len(squeaks) > 0:
+        for sq in squeaks:
+            seg = randomize_squeak(assets.squeak)
+            seg = assets.squeak.apply_gain(lin_to_db(sq.gain))
+            seg = apply_pan(seg, sq.pan) - 20
+            prob = max(0.2, 1.0 - dist / 20.0)  # drop-off with distance
+            if random.random() < prob:
+                seg = add_random_echoes(seg)
+            mix = mix.overlay(seg, position=sq.t_ms)
+
+    # --- add subtle ambient noise ---
+    ambient = AudioSegment.from_file("ambient.wav")
+    ambient = ambient - 55
+    mix = mix.overlay(ambient)
 
     mix = mixer.limiter(mix)
     return mix
