@@ -7,5 +7,7 @@
 # Ignore CSV data files
 *.csv
 *.CSV
+*.json
+*.JSON
 
 comprehensive_data.csv
