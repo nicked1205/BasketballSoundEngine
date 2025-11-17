@@ -3,8 +3,14 @@ import random
 from typing import List, Optional
 from dataclasses import dataclass
 from pydub import AudioSegment
+import pandas as pd
+import numpy as np
+from itertools import groupby
 
 from config import Court, Camera, Volumes, Audio
+
+
+MASTER_VOLUME = 10
 
 # ---------- DSP helpers ----------
 
@@ -24,6 +30,21 @@ def constant_power_pan(pan: float) -> (float, float):
 def apply_pan(seg: AudioSegment, pan: float) -> AudioSegment:
     L, R = constant_power_pan(pan)
     return seg.apply_gain_stereo(lin_to_db(L), lin_to_db(R))
+
+def seg_to_np(seg: AudioSegment) -> np.ndarray:
+    samples = np.array(seg.get_array_of_samples()).astype(np.int16)
+    samples = samples.reshape((-1, seg.channels))
+    return samples
+
+def np_to_seg(arr: np.ndarray, sample_rate: int) -> AudioSegment:
+    arr = np.clip(arr, -32768, 32767).astype(np.int16)
+    raw = arr.tobytes()
+    return AudioSegment(
+        data=raw,
+        sample_width=2,
+        frame_rate=sample_rate,
+        channels=2
+    )
 
 # ---------- Engine ----------
 
@@ -105,11 +126,11 @@ class Footstep:
 def step_interval_ms(speed_mps: float) -> float:
     # Piecewise-linear model for human gait
     if speed_mps < 0.2:
-        return 9999.0 / 1.5  # no steps if barely moving
+        return 9999.0  # no steps if barely moving
     if speed_mps < 1.0:
-        return (800.0 - 400.0 * (speed_mps - 0.3) / 0.7) / 1.5
+        return (800.0 - 400.0 * (speed_mps - 0.3) / 0.7)
     if speed_mps < 4.0:
-        return (400.0 - 100.0 * (speed_mps - 1.0) / 3.0) / 1.5
+        return (400.0 - 100.0 * (speed_mps - 1.0) / 3.0)
     # sprinting region
     return max(180.0, 300.0 - 20.0 * (speed_mps - 4.0))
 
@@ -166,50 +187,71 @@ def randomize_footstep(seg: AudioSegment, side: str) -> AudioSegment:
 
 def squeaks_from_frames(
     frames,
-    accel_threshold=4.5,        # m/s² minimum decel to trigger
-    turn_threshold_deg=45.0,    # must turn at least this angle
-    min_speed_for_event=1.5,    # ignore slow walks
-    cooldown=0.5,               # seconds between squeaks
+    accel_threshold=5.0,
+    turn_threshold_deg=60.0,
+    min_speed_for_event=6.0,
+    cooldown=0.5,
 ):
-    squeaks = []
-    last_vx, last_vy = frames[0].vx, frames[0].vy
-    last_speed = frames[0].speed_mps
-    last_t = frames[0].t_s
-    last_squeak_time = -999.0
+    """
+    Multi-player aware squeak detector.
+    Keeps vectorized math per player for speed.
+    """
+    if len(frames) < 2:
+        return []
 
-    for fr in frames[1:]:
-        dt = max(fr.t_s - last_t, 1e-3)
-        dv = last_speed - fr.speed_mps
-        decel = dv / dt if dv > 0 else 0.0
+    squeaks_all = []
 
-        # Direction change
-        dot = last_vx * fr.vx + last_vy * fr.vy
-        mag1 = math.hypot(last_vx, last_vy)
-        mag2 = math.hypot(fr.vx, fr.vy)
-        angle = 0.0
-        if mag1 > 1e-3 and mag2 > 1e-3:
-            cos_angle = max(-1.0, min(1.0, dot / (mag1 * mag2)))
-            angle = math.degrees(math.acos(cos_angle))
+    # --- group frames by player ---
+    frames.sort(key=lambda f: getattr(f, "player_id", 0))
+    for pid, group in groupby(frames, key=lambda f: getattr(f, "player_id", 0)):
+        f_list = list(group)
+        if len(f_list) < 2:
+            continue
 
-        # Conditions for squeak
-        is_turn = angle > turn_threshold_deg
+        # --- Extract arrays for this player ---
+        vx = np.array([f.vx for f in f_list], dtype=np.float32)
+        vy = np.array([f.vy for f in f_list], dtype=np.float32)
+        speed = np.array([f.speed_mps for f in f_list], dtype=np.float32)
+        t = np.array([f.t_s for f in f_list], dtype=np.float32)
+
+        # --- Compute deceleration and turn angles ---
+        dv = np.diff(speed)
+        dt = np.diff(t)
+        decel = np.maximum(0, -dv / np.maximum(dt, 1e-3))
+
+        dot = vx[:-1]*vx[1:] + vy[:-1]*vy[1:]
+        mag1 = np.hypot(vx[:-1], vy[:-1])
+        mag2 = np.hypot(vx[1:], vy[1:])
+        cos_angle = np.clip(dot / np.maximum(mag1*mag2, 1e-6), -1, 1)
+        angles = np.degrees(np.arccos(cos_angle))
+
+        # --- Boolean masks ---
+        is_turn = angles > turn_threshold_deg
         is_brake = decel > accel_threshold
-        is_moving = fr.speed_mps > min_speed_for_event
-        enough_time = (fr.t_s - last_squeak_time) > cooldown
+        is_moving = speed[1:] > min_speed_for_event
+        candidates = np.where((is_turn | is_brake) & is_moving)[0] + 1
 
-        if (is_turn or is_brake) and is_moving and enough_time:
+        # --- Apply cooldown ---
+        squeak_indices = []
+        last_time = -999.0
+        for idx in candidates:
+            if (t[idx] - last_time) > cooldown:
+                squeak_indices.append(idx)
+                last_time = t[idx]
+
+        # --- Build results ---
+        for idx in squeak_indices:
+            fr = f_list[idx]
             gain, pan, dist = compute_audio_params(fr)
-            squeaks.append(Footstep(
-                t_ms=int(fr.t_s * 1000.0),
+            squeaks_all.append(Footstep(
+                t_ms=int(fr.t_s * 1000),
                 gain=gain * 0.9,
                 pan=pan,
-                side="L"
+                side="L"  # reused Footstep class for squeaks
             ))
-            last_squeak_time = fr.t_s
 
-        last_vx, last_vy, last_speed, last_t = fr.vx, fr.vy, fr.speed_mps, fr.t_s
+    return squeaks_all
 
-    return squeaks
 
 def randomize_squeak(seg: AudioSegment) -> AudioSegment:
     # pitch jitter
@@ -264,11 +306,9 @@ def compute_audio_params(fr):
     w_d, w_i = 0.95, 0.05
     total_v = (w_d * dvol) + (w_i * (inten * dvol))
 
-    # --- Stereo pan (narrower spread, scaled to ±0.4) ---
-    pan = max(-1.0, min(1.0, fr.x * 0.4))
-
-    print(f"[debug] t={fr.t_s:.2f}s y={fr.y:.2f} dist={dist:.2f} dvol={dvol:.2f} inten={inten:.2f} total_v={total_v:.2f} pan={pan:.2f}")
-
+    # --- Stereo pan (narrower spread, scaled to ±0.7) ---
+    pan = max(-1.0, min(1.0, fr.x * 0.7))
+    
     return total_v, pan, dist
 
 # Adds random echoes to simulate complex reflections in an indoor court.
@@ -307,76 +347,290 @@ def add_reflections(seg: AudioSegment, dist: float) -> AudioSegment:
 
     return seg
 
-def generate_ambient_noise(duration_ms: int, sr: int) -> AudioSegment:
-    import numpy as np
-    n = int(sr * duration_ms / 1000)
-    noise = (np.random.randn(n) * 0.03).astype("float32")
+def extend_ambient(amb: AudioSegment, target_ms: int, crossfade_ms: int = 4000) -> AudioSegment:
+    """
+    Extends a short ambient AudioSegment to the desired duration using
+    random slicing + crossfades to avoid repetition artifacts.
+    """
+    result = AudioSegment.silent(duration=0, frame_rate=amb.frame_rate)
+    seg_len = len(amb)
 
-    # Band-limit the noise (simulate low-mid room hum)
-    from scipy.signal import butter, lfilter
-    b, a = butter(4, [100/(sr/2), 3000/(sr/2)], btype="band")
-    filtered = lfilter(b, a, noise)
+    while len(result) < target_ms:
+        # Pick a random start (avoid very end)
+        start = random.randint(0, max(0, seg_len - 30000))  # random 0–30 s offset
+        chunk = amb[start:start + random.randint(60000, 90000)]  # 1–1.5 min random section
+        if len(result) == 0:
+            result = chunk
+        else:
+            result = result.append(chunk, crossfade=crossfade_ms)
 
-    raw = (filtered * 32767).astype("int16").tobytes()
-    amb = AudioSegment(
-        data=raw,
-        sample_width=2,
-        frame_rate=sr,
-        channels=2
-    )
-    return amb - 25  # make it subtle
+    # Trim to exact length
+    result = result[:target_ms]
+
+    # Optional: gentle fade in/out to hide start/stop points
+    result = result.fade_in(5000).fade_out(5000)
+    return result
 
 # Render footsteps with alternating left/right samples
 
-def render_footsteps(frames, foot_path: Optional[str], duration_ms: int, cfg: Audio) -> AudioSegment:
+def render_footsteps(frames, foot_path: Optional[str], duration_ms: int, cfg: Audio):
+    """
+    Multi-player footsteps and squeaks rendered separately, 
+    but still mixed with global NumPy accumulation for speed.
+    """
     assets = Assets(cfg.sample_rate)
-    # load left/right variants (mono or stereo)
     assets.load(foot_path, squeak_path="./assets/squeak.wav")
-
     mixer = Mixer(cfg)
-    mix = mixer.make_timeline(duration_ms)
 
-    for ev in footsteps_from_frames(frames):
-        # Find the frame closest in time to this event
-        nearest = min(frames, key=lambda f: abs(f.t_s * 1000 - ev.t_ms))
+    mix_len = int(cfg.sample_rate * duration_ms / 1000)
+    mix_foot_total = np.zeros((mix_len, 2), dtype=np.int32)
+    mix_squeak_total = np.zeros((mix_len, 2), dtype=np.int32)
 
-        # Compute gain & pan from physical data
-        total_v, pan, dist = compute_audio_params(nearest)
+    all_foot_data = []
+    all_squeak_data = []
 
-        base = assets.foot_L if ev.side == "L" else assets.foot_R
+    # --- Group frames per player ---
+    frames.sort(key=lambda f: getattr(f, "player_id", 0))
+    player_groups = {pid: list(g) for pid, g in groupby(frames, key=lambda f: getattr(f, "player_id", 0))}
 
-        # --- randomized footstep processing ---
-        seg, offset = randomize_footstep(base, ev.side)
+    for pid, f_list in player_groups.items():
+        print(f"[player {pid}] rendering {len(f_list)} frames")
 
-        # --- add early reflections ---
-        seg = add_reflections(seg, dist)
+        frame_times = [f.t_s * 1000 for f in f_list]
 
-        # --- slight stereo bias depending on foot ---
-        pan_offset = -0.01 if ev.side == "L" else 0.01
-        seg = apply_pan(seg, max(-1.0, min(1.0, pan + pan_offset)))
+        def nearest_frame(t):
+            import bisect
+            i = bisect.bisect_left(frame_times, t)
+            if i <= 0: return f_list[0]
+            if i >= len(f_list): return f_list[-1]
+            return f_list[i]
 
-        # --- apply distance × intensity scaling ---
-        seg = seg.apply_gain(lin_to_db(total_v))
-        
-        mix = mix.overlay(seg, position=ev.t_ms)
-    
-    squeaks = squeaks_from_frames(frames)
-    print(f"[debug] {len(squeaks)} squeaks detected")
+        # --- Footsteps for this player ---
+        foot_events = footsteps_from_frames(f_list)
+        mix_foot = np.zeros((mix_len, 2), dtype=np.int32)
 
-    if assets.squeak is not None and len(squeaks) > 0:
-        for sq in squeaks:
-            seg = randomize_squeak(assets.squeak)
-            seg = assets.squeak.apply_gain(lin_to_db(sq.gain))
-            seg = apply_pan(seg, sq.pan) - 20
-            prob = max(0.2, 1.0 - dist / 20.0)  # drop-off with distance
-            if random.random() < prob:
-                seg = add_random_echoes(seg)
-            mix = mix.overlay(seg, position=sq.t_ms)
+        for ev in foot_events:
+            fr = nearest_frame(ev.t_ms)
+            total_v, pan, dist = compute_audio_params(fr)
+            base = assets.foot_L if ev.side == "L" else assets.foot_R
+            seg, offset = randomize_footstep(base, ev.side)
+            seg = add_reflections(seg, dist)
+            seg = apply_pan(seg, max(-1.0, min(1.0, pan + (-0.01 if ev.side == "L" else 0.01))))
+            seg = seg.apply_gain(lin_to_db(total_v))
+            seg = seg - 10 + MASTER_VOLUME
+            s = seg_to_np(seg)
+            start = int(ev.t_ms * cfg.sample_rate / 1000)
+            if start >= mix_len:
+                continue  # skip sounds beyond duration
+            end = start + s.shape[0]
+            if end > mix_len:
+                s = s[:mix_len - start]
+                end = mix_len
+            if end > start:
+                mix_foot[start:end] += s
+            all_foot_data.append({
+                "frame": ev.t_ms,
+                "vol": total_v,
+                "bal": pan,
+                "length": len(seg)
+            })
+            print(f"  [footstep @ {ev.t_ms} ms] gain={total_v:.2f} pan={pan:.2f}")
 
-    # --- add subtle ambient noise ---
-    ambient = AudioSegment.from_file("ambient.wav")
-    ambient = ambient - 55
-    mix = mix.overlay(ambient)
+        # --- Squeaks for this player ---
+        squeaks = squeaks_from_frames(f_list)
+        mix_squeak = np.zeros((mix_len, 2), dtype=np.int32)
 
-    mix = mixer.limiter(mix)
-    return mix
+        if assets.squeak is not None:
+            for sq in squeaks:
+                seg = randomize_squeak(assets.squeak)
+                seg = apply_pan(seg, sq.pan)
+                seg = seg.apply_gain(lin_to_db(sq.gain))
+                seg = seg - 10 + MASTER_VOLUME
+                if random.random() < max(0.2, 1.0 - sq.gain / 2.0):
+                    seg = add_random_echoes(seg)
+                s = seg_to_np(seg)
+                start = int(sq.t_ms * cfg.sample_rate / 1000)
+                if start >= mix_len:
+                    continue
+                end = start + s.shape[0]
+                if end > mix_len:
+                    s = s[:mix_len - start]
+                    end = mix_len
+                if end > start:
+                    mix_squeak[start:end] += s
+                all_squeak_data.append({
+                    "frame": sq.t_ms,
+                    "vol": sq.gain,
+                    "bal": sq.pan,
+                    "length": len(seg)
+                })
+                print(f"  [squeak @ {sq.t_ms} ms] gain={sq.gain:.2f} pan={sq.pan:.2f}")
+
+        # --- Accumulate into global mix ---
+        mix_foot_total += mix_foot
+        mix_squeak_total += mix_squeak
+
+    # --- Convert to segments and limit ---
+    mix_foot_seg = mixer.limiter(np_to_seg(mix_foot_total, cfg.sample_rate))
+    mix_squeak_seg = mixer.limiter(np_to_seg(mix_squeak_total, cfg.sample_rate))
+    combined = mix_foot_seg.overlay(mix_squeak_seg)
+
+    pd.DataFrame(all_foot_data).to_csv("footsteps_data.csv", index=False)
+    pd.DataFrame(all_squeak_data).to_csv("squeaks_data.csv", index=False)
+
+    # --- Optional ambient layer ---
+    try:
+        ambient = AudioSegment.from_file("./assets/ambient.wav").set_frame_rate(cfg.sample_rate).set_channels(2)
+        ambient_full = extend_ambient(ambient, duration_ms)
+        ambient_full = ambient_full + 10 + MASTER_VOLUME
+
+        # Export full ambient track separately
+        ambient_full.export("ambient_full.wav", format="wav")
+        print("[ok] Exported full ambient track: ambient_full.wav")
+
+        # Add it to the combined mix quietly
+        combined = combined.overlay(ambient_full)
+
+    except Exception as e:
+        print(f"[warn] Could not load ambient.wav: {e}")
+
+    return mix_foot_seg, mix_squeak_seg, combined
+
+def render_bounces(bounces, bounce_path: str, duration_ms: int, cfg: Audio):
+    from pydub import AudioSegment
+
+    # --- Load and preprocess base sample ---
+    base = AudioSegment.from_file(bounce_path).set_frame_rate(cfg.sample_rate).set_channels(2)
+    base_np = seg_to_np(base)
+    n_base = base_np.shape[0]
+    base_len_ms = len(base)
+
+    # --- Prepare master mix array ---
+    mix_len = int(cfg.sample_rate * duration_ms / 1000)
+    mix = np.zeros((mix_len, 2), dtype=np.int32)
+
+    # --- Precompute attenuation and panning ---
+    court = Court()
+    cam = Camera()
+    x = np.array([b.x for b in bounces], dtype=np.float32)
+    y = np.array([b.y for b in bounces], dtype=np.float32)
+    t_s = np.array([b.t_s for b in bounces], dtype=np.float32)
+
+    # Distance attenuation
+    x_m = x * (court.width_m / 2)
+    y_m = y * (court.depth_m / 2)
+    dx, dy, dz = x_m - cam.x_m, y_m - cam.y_m, -cam.z_m
+    dist = np.sqrt(dx**2 + dy**2 + dz**2)
+    d_ref = 8.0
+    dvol = np.maximum(0.25, (d_ref / np.maximum(dist, d_ref)) ** 1.6)
+    pan = np.clip(x * 0.7, -1.0, 1.0)
+
+    # --- Apply each bounce ---
+    bounce_data = []
+    for i, b in enumerate(bounces):
+        gain = dvol[i]
+
+        # small random pitch
+        rate_factor = random.uniform(0.9, 1.1)
+        seg = base._spawn(base.raw_data, overrides={"frame_rate": int(base.frame_rate * rate_factor)})
+        seg = seg.set_frame_rate(cfg.sample_rate)
+
+        L, R = constant_power_pan(pan[i])
+        gL, gR = lin_to_db(gain * L), lin_to_db(gain * R)
+        seg = base.apply_gain_stereo(gL, gR)
+
+        seg = seg + MASTER_VOLUME
+
+        # simple echo: mix a quiet delayed copy
+        if random.random() < 0.6:
+            delay = random.randint(70, 150)
+            echo = seg - random.uniform(15, 18)
+            seg = seg.overlay(echo, position=delay)
+
+        seg_np = seg_to_np(seg)
+        start = int(t_s[i] * cfg.sample_rate)
+        end = start + seg_np.shape[0]
+        if start >= mix_len:
+            continue
+        if end > mix_len:
+            seg_np = seg_np[:mix_len - start]
+            end = mix_len
+        mix[start:end] += seg_np
+
+        bounce_data.append({
+            "frame": b.frame,
+            "vol": float(gain),
+            "bal": float(pan[i]),
+            "length": base_len_ms
+        })
+
+    # --- Save metadata CSV ---
+    pd.DataFrame(bounce_data).to_csv("bounces_data.csv", index=False)
+
+    # --- Convert back to AudioSegment and limit ---
+    mix_bounce = np_to_seg(mix, cfg.sample_rate)
+    mixer = Mixer(cfg)
+    mix_bounce = mixer.limiter(mix_bounce)
+    return mix_bounce
+
+def render_claps(score_events, clap_path: str, duration_ms: int, cfg: Audio, fps: float):
+    """
+    For each scoring event, extract a random 4–6s segment of the clap sound
+    with a fade-out and overlay it at the event time.
+    """
+    from pydub import AudioSegment
+
+    clap_full = AudioSegment.from_file(clap_path).set_frame_rate(cfg.sample_rate).set_channels(2)
+    clap_len = len(clap_full)
+
+    mix_len = int(cfg.sample_rate * duration_ms / 1000)
+    mix = np.zeros((mix_len, 2), dtype=np.int32)
+
+    clap_data = []
+
+    for ev in score_events:
+        t_s = ev["t_s"]  # event time in seconds
+        points = ev.get("points", 2)
+
+        # choose random 4–6 s snippet
+        seg_dur = random.randint(3000, 5000)
+        if seg_dur >= clap_len:
+            start_ms = 0
+        else:
+            start_ms = random.randint(0, clap_len - seg_dur)
+        seg = clap_full[start_ms:start_ms + seg_dur].fade_out(1000)
+        seg = seg.fade_in(500)
+
+        # slight random gain and stereo variation
+        seg = seg.apply_gain(random.uniform(-2, 2))
+        seg = apply_pan(seg, 0)
+        seg = seg + 5 + MASTER_VOLUME
+
+        if random.random() < 0.7:
+            seg = add_random_echoes(seg, max_reflections=2)
+
+        # overlay into the mix
+        s = seg_to_np(seg)
+        start = int(t_s * cfg.sample_rate)
+        end = start + s.shape[0]
+        if start >= mix_len:
+            continue
+        if end > mix_len:
+            s = s[:mix_len - start]
+            end = mix_len
+        mix[start:end] += s
+
+        clap_data.append({
+            "frame": int(t_s * fps),
+            "vol": float(1.0) ,
+            "pan": float(0.0),
+            "length": seg_dur
+        })
+
+    # save metadata
+    pd.DataFrame(clap_data).to_csv("claps_data.csv", index=False)
+
+    mix_clap = np_to_seg(mix, cfg.sample_rate)
+    mixer = Mixer(cfg)
+    mix_clap = mixer.limiter(mix_clap)
+    return mix_clap
