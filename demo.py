@@ -17,8 +17,8 @@ if __name__ == "__main__":
     parser.add_argument("--player-id", type=int, default=None)
     parser.add_argument("--fps", type=float, default=25.00195)
     parser.add_argument("--foot", type=str, default="./assets/footsteps.mp3")
-    parser.add_argument("--out", type=str, default="res.wav")
-    parser.add_argument("--bounces", type=str, default="./data/bounce_5.json")
+    parser.add_argument("--out", type=str, default="res.mp3")
+    parser.add_argument("--bounces", type=str, default="./data/bounce_5_test.json")
     parser.add_argument("--bounce-sound", type=str, default="./assets/bounce.mp3")
     parser.add_argument("--game", type=int, default=5, help="Game ID")
     parser.add_argument("--sr", type=int, default=48000,
@@ -38,21 +38,21 @@ if __name__ == "__main__":
     # --- render audio ---
     audio_cfg = Audio(sample_rate=args.sr)
     mix_foot, mix_squeak, combined = render_footsteps(frames, args.foot, duration_ms, audio_cfg)
-    mix_foot.export(f"footsteps_{args.game}.wav", format="wav")
-    mix_squeak.export(f"squeaks_{args.game}.wav", format="wav")
+    mix_foot.export(f"footsteps_{args.game}.mp3", format="mp3")
+    mix_squeak.export(f"squeaks_{args.game}.mp3", format="mp3")
 
     bounces = load_bounces_from_json(
         path=args.bounces,
         fps=args.fps,
     )
     mix_bounce = render_bounces(bounces, args.bounce_sound, duration_ms, audio_cfg)
-    mix_bounce.export(f"bounces_{args.game}.wav", format="wav")
+    mix_bounce.export(f"bounces_{args.game}_test.mp3", format="mp3")
 
     # --- Load and render crowd claps ---
     score_events = load_score_events("./data/shots_5.csv", fps=args.fps)
     mix_clap = render_claps(score_events, "./assets/claps.wav", duration_ms, audio_cfg, fps=args.fps)
-    mix_clap.export(f"claps_{args.game}.wav", format="wav")
+    mix_clap.export(f"claps_{args.game}.mp3", format="mp3")
 
     final_mix = combined.overlay(mix_bounce).overlay(mix_clap)
-    final_mix.export("res.wav", format="wav")
-    print("[ok] Exported tracks: footsteps.wav, squeaks.wav, bounces.wav and full mix →", args.out)
+    final_mix.export("res.mp3", format="mp3")
+    print("[ok] Exported tracks: footsteps.mp3, squeaks.mp3, bounces.mp3 and full mix →", args.out)

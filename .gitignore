@@ -4,7 +4,7 @@
 *.wav
 *.WAV
 
-# Ignore CSV data files
+# Ignore data files
 *.csv
 *.CSV
 *.json

@@ -129,18 +129,22 @@ def load_frames_from_detection_json(
 
     for frame_str, content in data.items():
         frame = int(frame_str)
-        ids = content.get("object_id", [])
+        object_ids = content.get("object_id", [])
         coords = content.get("court_coord", None)
 
-        if len(ids) == 0:
+        if len(object_ids) == 0 or len(coords) == 0:
             continue
 
-        # Use provided court coordinates
-        for idx, (cx, cy) in enumerate(coords[:12], start=1):
+        # ensure matching length
+        n = min(len(object_ids), len(coords))
+
+        for i in range(n):
+            oid = object_ids[i]
+            cx, cy = coords[i]
 
             frames.append({
                 "frame_number": frame,
-                "player_id": int(idx),
+                "player_id": int(oid),  # ← use actual object_id
                 "x": float(cx),
                 "y": float(cy),
             })

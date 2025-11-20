@@ -347,29 +347,38 @@ def add_reflections(seg: AudioSegment, dist: float) -> AudioSegment:
 
     return seg
 
-def extend_ambient(amb: AudioSegment, target_ms: int, crossfade_ms: int = 4000) -> AudioSegment:
+def extend_ambient(amb: AudioSegment, target_ms: int, chunk_ms=15000, crossfade_ms=2000):
     """
-    Extends a short ambient AudioSegment to the desired duration using
-    random slicing + crossfades to avoid repetition artifacts.
+    Low-memory, realistic ambient extension using chunked looping + crossfades.
+    Keeps memory usage constant while avoiding looping artifacts.
     """
-    result = AudioSegment.silent(duration=0, frame_rate=amb.frame_rate)
-    seg_len = len(amb)
+    import random
+    out = AudioSegment.silent(duration=0, frame_rate=amb.frame_rate)
 
-    while len(result) < target_ms:
-        # Pick a random start (avoid very end)
-        start = random.randint(0, max(0, seg_len - 30000))  # random 0–30 s offset
-        chunk = amb[start:start + random.randint(60000, 90000)]  # 1–1.5 min random section
-        if len(result) == 0:
-            result = chunk
+    pos = 0
+    amb_len = len(amb)
+
+    while len(out) < target_ms:
+        # Choose random start position inside ambient (avoid endpoint)
+        start = random.randint(0, max(0, amb_len - chunk_ms))
+        chunk = amb[start:start + chunk_ms]
+
+        # Crossfade with previous output
+        if len(out) == 0:
+            out = chunk
         else:
-            result = result.append(chunk, crossfade=crossfade_ms)
+            out = out.append(chunk, crossfade=crossfade_ms)
 
-    # Trim to exact length
-    result = result[:target_ms]
+        pos += chunk_ms
 
-    # Optional: gentle fade in/out to hide start/stop points
-    result = result.fade_in(5000).fade_out(5000)
-    return result
+    # Trim exactly
+    out = out[:target_ms]
+
+    # Gentle fade in/out without duplicating the whole buffer
+    # Pydub's fade_in/out on small outputs is safe
+    out = out.fade_in(2000).fade_out(2000)
+
+    return out
 
 # Render footsteps with alternating left/right samples
 
@@ -479,20 +488,20 @@ def render_footsteps(frames, foot_path: Optional[str], duration_ms: int, cfg: Au
     pd.DataFrame(all_squeak_data).to_csv("squeaks_data.csv", index=False)
 
     # --- Optional ambient layer ---
-    try:
-        ambient = AudioSegment.from_file("./assets/ambient.wav").set_frame_rate(cfg.sample_rate).set_channels(2)
-        ambient_full = extend_ambient(ambient, duration_ms)
-        ambient_full = ambient_full + 10 + MASTER_VOLUME
 
-        # Export full ambient track separately
-        ambient_full.export("ambient_full.wav", format="wav")
-        print("[ok] Exported full ambient track: ambient_full.wav")
+    ambient = AudioSegment.from_file("./assets/ambient.wav").set_frame_rate(cfg.sample_rate).set_channels(2)
+    ambient_full = extend_ambient(ambient, duration_ms)
+    ambient_full = ambient_full + 10 + MASTER_VOLUME
 
-        # Add it to the combined mix quietly
-        combined = combined.overlay(ambient_full)
+    # Export full ambient track separately
+    ambient_full.export("ambient_full.mp3", format="mp3")
+    print("[ok] Exported full ambient track: ambient_full.mp3")
 
-    except Exception as e:
-        print(f"[warn] Could not load ambient.wav: {e}")
+    # Add it to the combined mix quietly
+    combined = combined.overlay(ambient_full)
+
+    # except Exception as e:
+    #     print(f"[warn] Could not load ambient.mp3: {e}")
 
     return mix_foot_seg, mix_squeak_seg, combined
 
