@@ -10,4 +10,4 @@
 *.json
 *.JSON
 
-comprehensive_data.csv
+data/
